@@ -1,16 +1,16 @@
-# This is a sample Python script.
+import flet as ft
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
-
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+from model.modello import Model
+from UI.view import View
+from UI.controller import Controller
 
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
+def main(page: ft.Page):
+    my_model = Model()
+    my_view = View(page)
+    my_controller = Controller(my_view, my_model)
+    my_view.set_controller(my_controller)
+    my_view.load_interface()
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+
+ft.app(target=main)
