@@ -29,7 +29,7 @@ class PortfolioSelector:
         mu: Mapping[str, float],
         params: Mapping[str, Any],
     ):
-        # ---------- 1. Conversione a rappresentazione NumPy ----------
+        # 1. CONVERSIONE A RAPPRESENTAZIONE NUMPY
 
         # Tickers nell'ordine delle colonne di rho
         self.tickers: List[str] = list(rho.columns)
@@ -40,7 +40,7 @@ class PortfolioSelector:
         rho_sub = rho.loc[self.tickers, self.tickers]
         self.rho_np: np.ndarray = rho_sub.values.astype(float)
 
-        # Rating
+        # Rating (vettori NumPy)
         self.rating_np: np.ndarray = np.full(self.n_assets, np.nan, dtype=float)
         self.has_rating_np: np.ndarray = np.zeros(self.n_assets, dtype=bool)
         for t, i in self.t2i.items():
@@ -65,7 +65,7 @@ class PortfolioSelector:
             v = mu.get(t)
             self.mu_np[i] = float(v) if v is not None else 0.0
 
-        # ---------- 2. Parametri / Vincoli (pre-calcolati) ----------
+        # 2. PARAMETRI / VINCOLI (PRE-CALCOLATI)
 
         self.params = params
 
@@ -93,6 +93,7 @@ class PortfolioSelector:
         if self.max_count_per_sector_param is not None:
             self.max_count_per_sector = int(self.max_count_per_sector_param)
         elif self.max_share_per_sector < 1.0 and self.K > 0:
+            # calcola la dimensione massima per settore
             self.max_count_per_sector = max(
                 1, int(np.floor(self.max_share_per_sector * self.K + 1e-9))
             )
@@ -104,18 +105,18 @@ class PortfolioSelector:
         else:
             self.max_rating_global = 0.0
 
-        # ---------- 3. Stato dei risultati ----------
+        # 3. STATO DEI RISULTATI
 
         self.best_subset: List[str] | None = None
         self.best_score: float = float("-inf")
         self.best_subset_indices: List[int] | None = None
 
-        # Questi saranno inizializzati in select(...)
+        # Questi saranno inizializzati in select(...) per la ricorsione
         self._cand_indices: np.ndarray | None = None
         self._mu_prefix: np.ndarray | None = None
         self._n_cand: int = 0
 
-    # ---------- PARAMETRI DI DEFAULT ----------
+    # PARAMETRI DI DEFAULT
 
     @staticmethod
     def build_default_params() -> Dict[str, Any]:
@@ -137,7 +138,7 @@ class PortfolioSelector:
         }
         return params
 
-    # ---------- STATIC METHODS: POLITICA DI SELEZIONE / PREFILTRO ----------
+    # STATIC METHODS: POLITICA DI SELEZIONE / PREFILTRO
 
     @staticmethod
     def build_selector_universe(
@@ -229,6 +230,7 @@ class PortfolioSelector:
             else:
                 rating_norm = 0.0
 
+            # calcolo score
             score = a1 * mu_i - a2 * sigma_i + a3 * rating_norm
             asset_scores[t] = float(score)
 
@@ -239,9 +241,7 @@ class PortfolioSelector:
             reverse=True,
         )
 
-        # Dimensione massima per la combinatoria:
-        #   - almeno min_size titoli
-        #   - oppure factor*K se più grande di min_size
+        # Dimensione massima per la combinatoria
         if K <= 0:
             max_dim = len(sorted_tickers)
         else:
@@ -272,12 +272,12 @@ class PortfolioSelector:
             rs = rating_scores.get(t)
             rs_val = rs if rs is not None else -1e9
             mu_val = mu.get(t, 0.0)
-            # rated prima (0), poi unrated (1); dentro ciascun gruppo ordina per rating/mu
+            # 0 se rated, 1 se unrated. Poi ordina per rating decrescente, poi mu decrescente.
             return (0 if hr else 1, -rs_val, -mu_val)
 
         return sorted(tickers, key=sort_key)
 
-    # ---------- METODI PRIVATI: SCORE E VINCOLI (versione NumPy) ----------
+    # METODI PRIVATI: SCORE E VINCOLI (versione NumPy)
 
     def _score_indices(self, indices: Sequence[int]) -> float:
         """
@@ -295,8 +295,10 @@ class PortfolioSelector:
             mean_corr = 0.0
         else:
             sub = self.rho_np[np.ix_(idx_arr, idx_arr)]
+            # indici della triangolare superiore (esclusa la diagonale)
             iu = np.triu_indices(n, k=1)
             vals = sub[iu]
+            # rimuovi eventuali NaN e calcola la media del modulo
             vals = vals[~np.isnan(vals)]
             if vals.size == 0:
                 mean_corr = 0.0
@@ -316,14 +318,17 @@ class PortfolioSelector:
             pen_sector = 0.0
         else:
             sec_ids = self.sector_id_np[idx_arr]
+            # considera solo gli ID settore validi (-1 è non assegnato)
             sec_ids = sec_ids[sec_ids != -1]
             if sec_ids.size == 0:
                 pen_sector = 0.0
             else:
                 counts = np.bincount(sec_ids)
                 shares = counts / float(n)
+                # calcola l'eccesso sopra la quota massima
                 excess = shares - self._max_share_eff
                 excess[excess < 0.0] = 0.0
+                # penalità = somma degli eccessi
                 pen_sector = float(np.sum(excess))
 
         # 4) Rendimento medio atteso
@@ -333,11 +338,12 @@ class PortfolioSelector:
         else:
             mean_return = 0.0
 
+        # CALCOLO SCORE FINALE
         score = (
-            self.alpha * (-mean_corr)
-            + self.beta * mean_rating
-            - self.gamma * pen_sector
-            + self.delta * mean_return
+            self.alpha * (-mean_corr)   # massimizza la decorrelazione
+            + self.beta * mean_rating   # massimizza il rating
+            - self.gamma * pen_sector   # minimizza la penalità settoriale
+            + self.delta * mean_return  # massimizza il rendimento atteso
         )
         return float(score)
 
@@ -361,12 +367,11 @@ class PortfolioSelector:
         # 2) Limiti per settore (usa self.max_count_per_sector)
         if self.max_count_per_sector is not None:
             sec_new = self.sector_id_np[new_idx]
-            if sec_new != -1:
+            if sec_new != -1: # se ha un settore assegnato
                 count = 1  # includo il nuovo
                 for idx in partial_indices:
                     if self.sector_id_np[idx] == sec_new:
                         count += 1
-                # Nota: nel codice originale si usava ">" (non ">=")
                 if count > self.max_count_per_sector:
                     return True
 
@@ -387,6 +392,7 @@ class PortfolioSelector:
         if self.rho_pair_max is not None and partial_indices:
             rho_max = float(self.rho_pair_max)
             arr_partial = np.asarray(partial_indices, dtype=np.int32)
+            # correlazione del nuovo titolo con quelli già scelti
             corrs = self.rho_np[arr_partial, new_idx]
             mask_valid = ~np.isnan(corrs)
             if np.any(np.abs(corrs[mask_valid]) > rho_max):
@@ -394,7 +400,7 @@ class PortfolioSelector:
 
         return False
 
-    # ---------- RICORSIONE + BRANCH & BOUND ----------
+    # RICORSIONE + BRANCH & BOUND
 
     def _search(
         self,
@@ -424,25 +430,25 @@ class PortfolioSelector:
 
         remaining_to_pick = self.K - k_curr
 
-        # Bound ottimistico (solo se abbiamo già una soluzione best)
+        # BOUND OTTIMISTICO (BRANCH & BOUND)
         if self.best_score != float("-inf"):
-            # Somma massima di mu che posso ancora aggiungere (ignorando vincoli)
-            # I candidati sono ordinati con un certo criterio, ma mu_prefix è
-            # la cumsum delle mu in quell'ordine.
+            # Somma massima di mu che posso ancora aggiungere
+            # Usa il prefix sum: mu fino a (start_pos + remaining_to_pick) meno mu fino a start_pos
             max_future_mu_sum = (
                 self._mu_prefix[start_pos + remaining_to_pick]
                 - self._mu_prefix[start_pos]
             )
             mu_sum_upper = sum_mu_partial + max_future_mu_sum
 
-            # rating_term <= beta * max_rating_global
-            # mu_term <= delta * (mu_sum_upper / K)
+            # Bound: rating massimo globale * beta, più il massimo mu possibile * delta
+            # La correlazione (alpha) e la penalità settoriale (gamma) sono negative
+            # e vengono ignorate per un bound ottimistico (bound sicuro).
             optimistic_bound = (
                 self.beta * self.max_rating_global
                 + self.delta * (mu_sum_upper / float(self.K))
             )
 
-            # Se anche nel caso più ottimistico non posso battere best_score → prune
+            # Pruning
             if optimistic_bound <= self.best_score:
                 return
 
@@ -454,15 +460,17 @@ class PortfolioSelector:
             if self._violates_constraints_indices(partial_indices, idx):
                 continue
 
+            # Inclusione e chiamata ricorsiva
             partial_indices.append(idx)
             self._search(
                 partial_indices,
                 pos + 1,
                 sum_mu_partial + self.mu_np[idx],
             )
+            # Backtracking
             partial_indices.pop()
 
-    # ---------- METODO PUBBLICO ----------
+    # METODO PUBBLICO
 
     def select(self, candidati: Sequence[str]) -> Tuple[List[str] | None, float]:
         """
@@ -506,13 +514,14 @@ class PortfolioSelector:
         # 3. Prefix-sum delle mu nell'ordine scelto (per il bound)
         mu_ordered = self.mu_np[self._cand_indices]
         self._mu_prefix = np.zeros(self._n_cand + 1, dtype=float)
+        # calcola la somma cumulativa e la salva dal secondo elemento
         np.cumsum(mu_ordered, out=self._mu_prefix[1:])
 
         # 4. Reset dei risultati
         self.best_subset_indices = None
         self.best_score = float("-inf")
 
-        # 5. Seed greedy iniziale: costruisce rapidamente un portafoglio valido
+        # 5. SEED GREEDY INIZIALE: trova rapidamente una soluzione valida per il bound
         greedy: List[int] = []
         sum_mu_greedy = 0.0
         for idx in self._cand_indices:
@@ -527,7 +536,7 @@ class PortfolioSelector:
             self.best_subset_indices = list(greedy)
             self.best_score = greedy_score
 
-        # 6. Ricerca ricorsiva con pruning
+        # 6. Ricerca ricorsiva con pruning (Branch & Bound)
         self._search(
             partial_indices=[],
             start_pos=0,

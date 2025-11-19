@@ -9,7 +9,7 @@ import numpy as np
 from model.stock import Stock
 
 
-# Path di default: i due CSV dentro la cartella "database"
+# DEFINIZIONE PATH
 BASE_DIR = os.path.dirname(__file__)
 DEFAULT_PRICES_PATH = os.path.join(BASE_DIR, "all_stocks_5yr.csv")
 DEFAULT_RATINGS_PATH = os.path.join(BASE_DIR, "corporateCreditRatingWithFinancialRatios.csv")
@@ -17,11 +17,8 @@ DEFAULT_RATINGS_PATH = os.path.join(BASE_DIR, "corporateCreditRatingWithFinancia
 
 class DAO:
     """
-    Data Access Object:
-    - legge i file all_stocks_5yr.csv e corporateCreditRatingWithFinancialRatios.csv
-    - costruisce i DataFrame dei prezzi e dei rating
-    - costruisce il dizionario di Stock per TUTTI i ticker dei prezzi,
-      impostando rating_score=None per quelli senza rating.
+    Data Access Object: gestisce il caricamento dei dati da file CSV
+    e la costruzione del dizionario di oggetti Stock.
     """
 
     def __init__(self,
@@ -33,19 +30,19 @@ class DAO:
         self._prices_df: pd.DataFrame | None = None
         self._ratings_df: pd.DataFrame | None = None
 
-    # ---------- METODI PRIVATI DI CARICAMENTO ----------
+    # METODI PRIVATI DI CARICAMENTO
 
     def _load_prices(self) -> pd.DataFrame:
         """
         Legge all_stocks_5yr.csv e costruisce un DataFrame pivotato:
-        index = date, columns = ticker (Name), values = close
+        index = date, columns = ticker (Name), values = close.
         """
         if self._prices_df is not None:
             return self._prices_df
 
         df = pd.read_csv(self._prices_path)
 
-        # colonne attese: 'date', 'open', 'high', 'low', 'close', 'volume', 'Name'
+        # normalizza la data e pivotta il DataFrame
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values("date")
 
@@ -65,7 +62,7 @@ class DAO:
 
         df = pd.read_csv(self._ratings_path)
 
-        # mapping rating alfabetico → rating_score
+        # MAPPING RATING ALFABETICO → NUMERICO
         rating_map = {
             "AAA": 22, "AA+": 21, "AA": 20, "AA-": 19,
             "A+": 18, "A": 17, "A-": 16,
@@ -82,7 +79,7 @@ class DAO:
         self._ratings_df = df
         return self._ratings_df
 
-    # ---------- METODI PUBBLICI ----------
+    # METODI PUBBLICI DI ACCESSO
 
     def get_prices_df(self) -> pd.DataFrame:
         """
@@ -99,12 +96,7 @@ class DAO:
     def build_stock_dict(self) -> Dict[str, Stock]:
         """
         Restituisce un dizionario ticker → Stock per TUTTI i ticker dei prezzi.
-        Per i ticker che hanno un rating:
-            - usa l'ULTIMO rating disponibile nel dataset.
-        Per i ticker che NON hanno rating:
-            - rating_score = None
-            - sector = None
-            - rating_date = None
+        I rating vengono aggiunti se disponibili (ultimo rating valido).
         """
         prices = self._load_prices()
         ratings = self._load_ratings()
@@ -112,7 +104,7 @@ class DAO:
         tickers_prices = set(prices.columns)
         tickers_ratings = set(ratings["Ticker"].unique())
 
-        # ultimo rating per ticker (solo per quelli che hanno almeno un rating)
+        # estrai l'ULTIMO rating per ticker (per i soli ticker che hanno un rating)
         last_ratings = (
             ratings.sort_values("Rating Date")
                    .groupby("Ticker")
@@ -124,13 +116,15 @@ class DAO:
 
         for ticker in sorted(tickers_prices):
             if ticker in tickers_ratings:
+                # Ticker con rating disponibile
                 row = last_ratings.loc[ticker]
 
                 rating_score = float(row["rating_score"]) if pd.notna(row["rating_score"]) else None
+                # Il settore non è sempre disponibile in tutte le righe del rating DF
                 sector = row["Sector"] if "Sector" in row.index else None
                 rating_date = row["Rating Date"]
             else:
-                # Ticker senza rating
+                # Ticker senza rating: imposta a None
                 rating_score = None
                 sector = None
                 rating_date = None
@@ -142,7 +136,7 @@ class DAO:
                 rating_date=rating_date
             )
 
-            # serie prezzi 'close' per questo ticker
+            # assegna la serie prezzi 'close' allo Stock
             price_series = prices[ticker]
             s.set_prices(price_series)
 
@@ -162,7 +156,7 @@ class DAO:
 
 
 if __name__ == "__main__":
-    # Test rapido del DAO
+    # TEST RAPIDO DEL DAO
     dao = DAO()
 
     prices = dao.get_prices_df()

@@ -30,9 +30,10 @@ class Stock:
         """
         Imposta la serie dei prezzi (close) e calcola i rendimenti log.
         """
+        # IMPOSTA I PREZZI
         prices = prices.sort_index().astype(float)
         self.prices = prices
 
-        # log-return: log(p_t / p_{t-1}) = log(p_t) - log(p_{t-1})
+        # calcola i rendimenti log: log(p_t / p_{t-1})
         log_prices = prices.apply(np.log)          # Series
-        self.returns = log_prices.diff()
+        self.returns = log_prices.diff() # la differenza calcola log(p_t) - log(p_{t-1})

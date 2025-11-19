@@ -1,4 +1,3 @@
-# model/portfolio_weights.py
 from __future__ import annotations
 
 from typing import Dict, Sequence, Literal, Optional
@@ -58,6 +57,7 @@ class PortfolioWeights:
         # Aggiusta eventuale differenza sulla somma
         diff = 1.0 - w_rounded.sum()
         if abs(diff) > 1e-6 and len(w_rounded) > 0:
+            # aggiusta sulla componente più grande
             j = int(np.argmax(w_rounded))
             w_rounded[j] += diff
 
@@ -89,7 +89,7 @@ class PortfolioWeights:
         if n == 0:
             return {}
 
-        # Se mancano mu o Sigma_sh, fallback
+        # GESTIONE DEI FALLBACK
         if mu is None or Sigma_sh is None:
             return PortfolioWeights._equal_weights(tickers)
 
@@ -103,7 +103,7 @@ class PortfolioWeights:
         mu_vec = mu.loc[tickers].astype(float).values  # shape (n,)
         Sigma_sub = Sigma_sh.loc[tickers, tickers].astype(float).values  # shape (n, n)
 
-        # Regolarizzazione
+        # Regolarizzazione e calcolo inversa
         Sigma_reg = Sigma_sub + ridge * np.eye(n)
         ones = np.ones(n)
 
@@ -113,7 +113,7 @@ class PortfolioWeights:
             # Matrice non invertibile -> fallback
             return PortfolioWeights._equal_weights(tickers)
 
-        # Soluzione mean-variance con vincolo somma w_i = 1
+        # Soluzione mean-variance con vincolo somma w_i = 1 (formula chiusa)
         c = risk_aversion * mu_vec
         Ac = A @ c
         A1 = A @ ones
@@ -126,41 +126,41 @@ class PortfolioWeights:
         lam = num / den
         w_raw = A @ (c - lam * ones)  # soluzione unconstrained sul simplex
 
-        # -----  vincolo w_i >= 1/(2K) -----
+        # APPLICAZIONE VINCOLO W_I >= 1/(2K)
 
-        # 1) Impedisci valori negativi
+        # 1) impedisci valori negativi
         w_raw = np.maximum(w_raw, 0.0)
 
-        # Se tutti sono zero, fallback
+        # se tutti sono zero, fallback
         if w_raw.sum() <= 0:
             return PortfolioWeights._equal_weights(tickers)
 
-        # 2) Floor w_min = 1/(2K)
+        # 2) floor w_min = 1/(2K)
         w_min = 1.0 / (2.0 * n)  # vincolo hard desiderato
 
-        # Somma minima dovuta ai floor
+        # verifica caso patologico (floor troppo alto)
         floor_sum = n * w_min
         if floor_sum >= 1.0:
-            # Caso patologico: floor troppo alto -> fallback pesi uguali
             return PortfolioWeights._equal_weights(tickers)
 
-        # 3) Residuo da distribuire sopra il floor
+        # 3) residuo da distribuire sopra il floor
         residual = 1.0 - floor_sum
         if residual <= 0:
+            # i pesi minimi sommano a 1, usa pesi uguali
             return PortfolioWeights._equal_weights(tickers)
 
-        # 4) Distribuisco il residual proporzionalmente ai pesi raw
+        # 4) distribuisco il residual proporzionalmente ai pesi raw
         base = w_raw.copy()
         base_sum = base.sum()
         if base_sum <= 0:
             return PortfolioWeights._equal_weights(tickers)
 
-        base = base / base_sum        # somma 1
-        z = residual * base           # parte "libera"
+        base = base / base_sum        # normalizza la base a somma 1
+        z = residual * base           # parte "libera" che somma a 'residual'
 
         w_final = w_min + z           # ogni w_i >= w_min, somma a 1
 
-        # 5) Arrotonda a 2 decimali
+        # 5) ARROTONDA A 2 DECIMALI
         return PortfolioWeights._round_weights_to_2_decimals(tickers, w_final)
 
 
@@ -185,8 +185,10 @@ class PortfolioWeights:
         tickers = list(tickers)
 
         if mode == "eq" or mu is None or Sigma_sh is None:
+            # FALLBACK A PESI UGUALI se mode="eq" o dati mancanti
             return PortfolioWeights._equal_weights(tickers)
 
+        # CALCOLO PESI MEAN-VARIANCE
         return PortfolioWeights._mean_variance_weights(
             tickers=tickers,
             mu=mu,

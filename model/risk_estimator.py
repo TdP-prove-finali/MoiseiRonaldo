@@ -13,7 +13,7 @@ class RiskEstimator:
     matrici di rischio (rho, Sigma) e dei rendimenti attesi (mu).
     """
 
-    # ---------- PRE-PROCESSING RENDIMENTI ----------
+    # PRE-PROCESSING RENDIMENTI
 
     @staticmethod
     def compute_returns(prices_df: pd.DataFrame) -> pd.DataFrame:
@@ -23,6 +23,7 @@ class RiskEstimator:
         r_{i,t} = log(p_{i,t} / p_{i,t-1})
         """
         prices = prices_df.sort_index().astype(float)
+        # logaritmo naturale del rapporto tra prezzo di oggi e prezzo di ieri
         returns = np.log(prices / prices.shift(1))
         return returns
 
@@ -43,15 +44,16 @@ class RiskEstimator:
             )
 
         wins = returns_df.copy()
-        # quantili per colonna
+        # calcola i quantili per colonna (i limiti)
         qs = wins.quantile([lower, upper], axis=0)
         lower_q = qs.loc[lower]
         upper_q = qs.loc[upper]
 
+        # applica il clipping (sostituisce i valori estremi con i limiti)
         wins = wins.clip(lower=lower_q, upper=upper_q, axis=1)
         return wins
 
-    # ---------- STIMA DI BASE ----------
+    # STIMA DI BASE
 
     @staticmethod
     def estimate_corr_cov_mu(
@@ -72,15 +74,15 @@ class RiskEstimator:
         if returns_window is None or returns_window.empty:
             raise ValueError("returns_window è vuoto.")
 
-        # rimuovo righe completamente NaN
-        R = returns_window.dropna(how="all").copy()
+        # pre-processing iniziale
+        R = returns_window.dropna(how="all").copy() # rimuovo righe completamente NaN
         T_len = len(R)
         if T_len == 0:
             raise ValueError(
                 "returns_window è vuoto dopo aver rimosso le righe tutte NaN."
             )
 
-        # filtro colonne con abbastanza osservazioni non-NaN
+        # filtro colonne (titoli) con troppi NaN
         valid_counts = R.notna().sum(axis=0)
         min_non_na = int(np.ceil(min_non_na_ratio * T_len))
         valid_cols = valid_counts[valid_counts >= min_non_na].index.tolist()
@@ -92,27 +94,28 @@ class RiskEstimator:
                 "Numero di titoli valido < 2, impossibile stimare ρ e Σ."
             )
 
-        # riempio gli eventuali NaN residui con la media di colonna
+        # riempio gli eventuali NaN residui con la media di colonna (imputazione)
         R = R.fillna(R.mean(axis=0))
 
-        # vettore dei rendimenti attesi
+        # STIMA EMPIRICA
         mu = R.mean(axis=0)
-
-        # covarianza e correlazione empiriche
         Sigma = R.cov()
         rho = R.corr()
 
+        # SHRINKAGE
         if not (0.0 <= shrink_lambda <= 1.0):
             raise ValueError("shrink_lambda deve essere in [0,1].")
 
         # matrice target T per lo shrinkage
         if shrink_target == "diagonal":
+            # matrice diagonale con le varianze (media delle varianze se identity)
             Tmat = pd.DataFrame(
                 np.diag(np.diag(Sigma.values)),
                 index=Sigma.index,
                 columns=Sigma.columns,
             )
         elif shrink_target == "identity":
+            # target matrice identità con varianza media
             avg_var = float(np.mean(np.diag(Sigma.values)))
             Tmat = pd.DataFrame(
                 np.eye(Sigma.shape[0]) * avg_var,
@@ -124,7 +127,7 @@ class RiskEstimator:
                 "shrink_target non supportato. Usa 'diagonal' o 'identity'."
             )
 
-        # shrinkage semplice: convex combination tra Sigma e Tmat
+        # shrinkage semplice: convex combination (1-λ)*Sigma + λ*Tmat
         Sigma_sh = (1.0 - shrink_lambda) * Sigma + shrink_lambda * Tmat
 
         return rho, Sigma_sh, mu
@@ -152,6 +155,7 @@ class RiskEstimator:
 
         R = returns_df.copy()
 
+        # winsorization (se richiesta)
         if winsor_lower is not None and winsor_upper is not None:
             R = RiskEstimator.winsorize(
                 R,
@@ -172,7 +176,7 @@ if __name__ == "__main__":
 
     print("=== TEST RISK_ESTIMATOR (OOP) ===")
 
-    # Simuliamo 500 giorni di prezzi per 4 titoli
+    # simuliamo 500 giorni di prezzi per 4 titoli
     dates = pd.date_range(start="2018-01-01", periods=500, freq="B")
     rng = np.random.default_rng(42)
     prices_data = np.exp(
@@ -206,6 +210,7 @@ if __name__ == "__main__":
         print("Shape Sigma_sh:", Sigma_sh.shape)
         print("Shape mu:", mu.shape)
 
+        # test di validazione
         if rho.shape[0] != rho.shape[1]:
             raise AssertionError("rho non è quadrata.")
         if Sigma_sh.shape != rho.shape:

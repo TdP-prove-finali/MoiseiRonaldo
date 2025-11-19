@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Tuple
 
 import pandas as pd
 import networkx as nx
@@ -55,11 +55,48 @@ class Model:
         self.selector_universe: List[str] = []
 
         # Risultati ultima ottimizzazione
-        self.last_portfolio_tickers: list[str] = []
+        self.last_portfolio_tickers: List[str] = []
         self.last_portfolio_weights: Dict[str, float] = {}
         self.last_portfolio_score: float | None = None
 
-    # ---------- CARICAMENTO DATI ----------
+        # Profilo di rischio corrente (parametri "globali" per grafi e selettore)
+        self._risk_profile: Dict[str, Any] | None = None
+
+        # INIZIALIZZAZIONE AUTOMATICA: CARICAMENTO DATI E STIMA RISCHIO
+        print("[Model] Inizio caricamento dati dal DAO...")
+        self.load_data_from_dao()
+        print("[Model] Dati caricati. Stima del rischio...")
+        self.estimate_risk(
+            shrink_lambda=0.1,
+            min_non_na_ratio=0.8,
+            winsor_lower=0.01,
+            winsor_upper=0.99,
+        )
+        print("[Model] Stima di rho, Sigma_sh e mu completata.")
+
+    # PROFILO DI RISCHIO
+
+    def set_risk_profile(self, profile: Dict[str, Any]) -> None:
+        """
+        Imposta (o sovrascrive) il profilo di rischio corrente.
+
+        Esempio di dizionario:
+            {
+                "tau": 0.30,
+                "k": 10,
+                "max_size": 60,
+                "max_unrated_share": 0.25,
+                "min_rating_score": 13.0,
+                "target_rated_share": 0.7,
+                "rating_min": 13.0,
+                "rho_pair_max": 0.8,
+                "weights_mode": "mv",
+                "mv_risk_aversion": 1.0,
+            }
+        """
+        self._risk_profile = dict(profile)
+
+    # CARICAMENTO DATI
 
     def load_data_from_dao(self) -> None:
         """
@@ -93,7 +130,7 @@ class Model:
             for t, s in self.stocks.items()
         }
 
-    # ---------- STIMA RISCHIO SULL'INTERA STORIA ----------
+    # STIMA RISCHIO SULL'INTERA STORIA
 
     def estimate_risk(
         self,
@@ -131,55 +168,58 @@ class Model:
         self.reduced_universe = []
         self.selector_universe = []
 
-    # ---------- GRAFO E UNIVERSO RIDOTTO ----------
+    # GRAFO E UNIVERSO RIDOTTO U'
 
     def build_reduced_universe(
         self,
         tau: float | None = None,
         k: int | None = None,
-        max_size: int = 60,
-        max_unrated_share: float = 1.0,
-        min_rating_score: float = 13.0,
-        target_rated_share: float = 0.7,
-    ) -> list[str]:
+        max_size: int | None = None,
+        max_unrated_share: float | None = None,
+        min_rating_score: float | None = None,
+        target_rated_share: float | None = None,
+    ) -> List[str]:
         """
         Costruisce:
         - il grafo di correlazione corrente (self.current_graph),
         - un universo ridotto U' (lista di ticker) salvato in self.reduced_universe.
 
-        Passi:
-        1) parte da current_rho,
-        2) restringe eventualmente ai soli titoli con rating se max_unrated_share == 0,
-        3) usa GraphBuilder.build_filtered_graph per costruire grafo, adj e dist_kNN,
-        4) calcola la strength di ogni nodo,
-        5) seleziona U' bilanciando pool rated / unrated e privilegiando strength bassa.
+        I parametri possono essere passati direttamente (per uso avanzato) oppure
+        lasciati a None: in quel caso, se presente, verrà utilizzato il profilo
+        di rischio corrente (_risk_profile), altrimenti i default interni.
         """
         if self.current_rho is None:
             raise RuntimeError(
                 "current_rho non disponibile. Chiama estimate_risk() prima di build_reduced_universe()."
             )
 
+        # Parametri effettivi: override diretto > profilo di rischio > default
+        prof = self._risk_profile or {}
+
+        if tau is None:
+            tau = prof.get("tau", None)
+        if k is None:
+            k = prof.get("k", None)
+        if max_size is None:
+            max_size = int(prof.get("max_size", 60))
+        if max_unrated_share is None:
+            max_unrated_share = float(prof.get("max_unrated_share", 1.0))
+        if min_rating_score is None:
+            min_rating_score = float(prof.get("min_rating_score", 13.0))
+        if target_rated_share is None:
+            target_rated_share = float(prof.get("target_rated_share", 0.7))
+
         rho_full = self.current_rho.copy()
         tickers_all = list(rho_full.columns)
 
-        # --- 1) Restrizione iniziale in base a max_unrated_share ---
+        # 1) Restrizione iniziale in base a max_unrated_share
+        base_tickers, rho = self._build_universe_base(
+            tickers_all=tickers_all,
+            rho_full=rho_full,
+            max_unrated_share=max_unrated_share,
+        )
 
-        if max_unrated_share == 0.0:
-            # Universo iniziale: solo titoli con rating (indipendentemente dal valore)
-            base_tickers = [
-                t for t in tickers_all if self.map_has_rating.get(t, False)
-            ]
-            if not base_tickers:
-                raise ValueError(
-                    "Nessun titolo con rating disponibile nell'universo corrente."
-                )
-            rho = rho_full.loc[base_tickers, base_tickers]
-        else:
-            base_tickers = tickers_all
-            rho = rho_full.loc[base_tickers, base_tickers]
-
-        # --- 2) Costruzione grafo + adj + dist_knn tramite GraphBuilder ---
-
+        # 2) Costruzione grafo + adj + dist_knn tramite GraphBuilder
         G, adj, dist_knn = GraphBuilder.build_filtered_graph(
             rho=rho,
             tau=tau,
@@ -188,13 +228,62 @@ class Model:
         )
         self.current_graph = G
 
-        # --- 3) Calcolo strength e definizione dei due pool ---
+        # 3) Selezione effettiva di U'
+        reduced = self._select_reduced_universe(
+            adj=adj,
+            min_rating_score=min_rating_score,
+            max_unrated_share=max_unrated_share,
+            max_size=max_size,
+            target_rated_share=target_rated_share,
+        )
 
+        self.reduced_universe = reduced
+        # azzera l'eventuale selector_universe perché dipende da K
+        self.selector_universe = []
+
+        return reduced
+
+    def _build_universe_base(
+        self,
+        tickers_all: List[str],
+        rho_full: pd.DataFrame,
+        max_unrated_share: float,
+    ) -> Tuple[List[str], pd.DataFrame]:
+        """
+        Applica la logica di base su rated/unrated per decidere
+        l'universo iniziale su cui costruire il grafo.
+        """
+        if max_unrated_share == 0.0:
+            # Universo iniziale: solo titoli con rating
+            base_tickers = [
+                t for t in tickers_all if self.map_has_rating.get(t, False)
+            ]
+            if not base_tickers:
+                raise ValueError(
+                    "Nessun titolo con rating disponibile nell'universo corrente."
+                )
+        else:
+            base_tickers = tickers_all
+
+        rho = rho_full.loc[base_tickers, base_tickers]
+        return base_tickers, rho
+
+    def _select_reduced_universe(
+        self,
+        adj: pd.DataFrame,
+        min_rating_score: float,
+        max_unrated_share: float,
+        max_size: int,
+        target_rated_share: float,
+    ) -> List[str]:
+        """
+        Contiene la logica di bilanciamento rated/unrated e strength.
+        """
         strength = adj.sum(axis=1)  # somma dei pesi |rho_ij| per ogni nodo
         all_candidates = list(strength.index)
 
-        pool_rated: list[str] = []
-        pool_unrated: list[str] = []
+        pool_rated: List[str] = []
+        pool_unrated: List[str] = []
 
         for t in all_candidates:
             stock = self.stocks.get(t)
@@ -204,18 +293,14 @@ class Model:
             else:
                 pool_unrated.append(t)
 
-        # --- 4) Quote per U': N_Rated, N_Unrated ---
-
         # limito max_size al numero totale di candidati
         if max_size is None or max_size > len(all_candidates):
             max_size = len(all_candidates)
 
+        # Quote per rated / unrated
         if max_unrated_share == 0.0:
-            # nessun titolo unrated/speculativo nell'universo ridotto:
             target_rated_share_effective = 1.0
         else:
-            # di default usiamo target_rated_share, ma garantiamo
-            # che la quota target di unrated non superi max_unrated_share
             target_unrated_share = 1.0 - target_rated_share
             if target_unrated_share > max_unrated_share:
                 target_unrated_share = max_unrated_share
@@ -234,8 +319,7 @@ class Model:
         N_rated = min(N_rated_target, len(pool_rated))
         N_unrated = min(N_unrated_target, len(pool_unrated))
 
-        # --- 5) Selezione effettiva per strength bassa ---
-
+        # Ordinamento per strength crescente (scegliamo i titoli meno correlati)
         rated_strength = (
             strength.loc[pool_rated].sort_values(ascending=True)
             if pool_rated
@@ -268,31 +352,22 @@ class Model:
                 extra = list(remaining_strength.index[:remaining_slots])
                 selected.update(extra)
 
-        reduced = list(selected)
+        return list(selected)
 
-        self.reduced_universe = reduced
-        # azzera l'eventuale selector_universe perché dipende da K
-        self.selector_universe = []
-
-        return reduced
-
-    # ---------- OTTIMIZZAZIONE PORTAFOGLIO ----------
+    # OTTIMIZZAZIONE PORTAFOGLIO (Branch & Bound)
 
     def optimize_portfolio(
         self,
         params: Optional[Dict[str, Any]] = None,
         use_reduced_universe: bool = True,
-    ) -> tuple[list[str] | None, Dict[str, float], float | None]:
+    ) -> Tuple[List[str] | None, Dict[str, float], float | None]:
         """
-        Esegue la selezione combinatoria del portafoglio su:
-            - selector_universe (pre-filtro quantitativo su U' o sull'universo pieno),
-            - se use_reduced_universe=True e self.reduced_universe non è vuoto, usa U' come base,
-            - altrimenti usa current_rho.columns come base.
+        Esegue la selezione combinatoria del portafoglio.
 
-        Parametri:
-            - params: dict con K, rating_min, max_unrated_share, alpha, beta, gamma, delta, ecc.
-                      Se None, usa PortfolioSelector.build_default_params().
-            - use_reduced_universe: se True prova a usare self.reduced_universe come base.
+        - Se 'params' è None, parte dai default del PortfolioSelector e
+          integra, se presente, il profilo di rischio.
+        - Se 'params' è fornito, i valori espliciti in params hanno priorità
+          rispetto al profilo di rischio.
         """
         if self.current_rho is None or self.current_mu is None:
             raise RuntimeError(
@@ -300,33 +375,20 @@ class Model:
                 "Chiama prima estimate_risk(), poi (eventualmente) build_reduced_universe()."
             )
 
-        rho = self.current_rho
-        mu_series = self.current_mu
+        # 1) Costruzione parametri completi
+        full_params = self._build_selector_params(params)
+        K = int(full_params.get("K", 0))
+        if K <= 0:
+            raise ValueError("Parametro K mancante o non valido nei params.")
 
-        # Parametri di default se non forniti
-        if params is None:
-            params = PortfolioSelector.build_default_params()
-
-        # Scegli l'universo base: U' se disponibile, altrimenti tutto
-        if use_reduced_universe and self.reduced_universe:
-            base_universe = [
-                t
-                for t in self.reduced_universe
-                if t in rho.columns and t in mu_series.index
-            ]
-        else:
-            base_universe = [
-                t for t in rho.columns if t in mu_series.index
-            ]
-
+        # 2) Scegli l'universo base: U' se disponibile, altrimenti tutto
+        base_universe = self._get_base_universe_for_selection(use_reduced_universe)
         if not base_universe:
             raise ValueError(
                 "Nessun titolo disponibile per l'ottimizzazione (universo vuoto)."
             )
 
-        # ---------- STEP 1: pre-filtro quantitativo (nel Selector) ----------
-
-        K = int(params.get("K", 0))
+        # 3) Pre-filtro quantitativo (nel Selector)
         universe = PortfolioSelector.build_selector_universe(
             base_universe=base_universe,
             K=K,
@@ -341,7 +403,121 @@ class Model:
                 "selector_universe vuoto dopo il pre-filtro quantitativo."
             )
 
-        # ---------- STEP 2: costruzione dizionari per il Selector ----------
+        # 4) Costruzione dizionari per il Selector
+        rho_sub, rating_scores, sectors, has_rating, mu_dict = \
+            self._build_selector_inputs(universe)
+
+        # 5) Ordinamento candidati (nel Selector)
+        candidati = PortfolioSelector.sort_candidates(
+            tickers=universe,
+            rating_scores=rating_scores,
+            has_rating=has_rating,
+            mu=mu_dict,
+        )
+
+        # 6) Selezione combinatoria
+        selector = PortfolioSelector(
+            rho=rho_sub,
+            rating_scores=rating_scores,
+            sectors=sectors,
+            has_rating=has_rating,
+            mu=mu_dict,
+            params=full_params,
+        )
+        best_subset, best_score = selector.select(candidati=candidati)
+
+        if best_subset is None or len(best_subset) == 0:
+            # Nessuna soluzione che rispetti i vincoli
+            self.last_portfolio_tickers = []
+            self.last_portfolio_weights = {}
+            self.last_portfolio_score = None
+            return None, {}, None
+
+        # 7) Calcolo pesi (solo long)
+        mode = full_params.get("weights_mode", "mv")          # "mv" o "eq"
+        risk_aversion = float(full_params.get("mv_risk_aversion", 1.0))
+
+        weights = PortfolioWeights.compute(
+            tickers=list(best_subset),
+            mode=mode,
+            mu=self.current_mu,
+            Sigma_sh=self.current_Sigma_sh,
+            risk_aversion=risk_aversion,
+        )
+
+        self.last_portfolio_tickers = list(best_subset)
+        self.last_portfolio_weights = weights
+        self.last_portfolio_score = float(best_score)
+
+        return list(best_subset), weights, float(best_score)
+
+    def _build_selector_params(
+        self,
+        params: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Merge tra default del PortfolioSelector, profilo di rischio (se presente)
+        e params espliciti passati dal chiamante (che hanno priorità).
+        """
+        base = PortfolioSelector.build_default_params()
+
+        # Integra profilo di rischio (solo se presente)
+        if self._risk_profile is not None:
+            prof = self._risk_profile
+            for key in [
+                "rating_min",
+                "max_unrated_share",
+                "rho_pair_max",
+                "weights_mode",
+                "mv_risk_aversion",
+            ]:
+                if key in prof:
+                    base[key] = prof[key]
+
+        # Sovrascrive con i params espliciti (priorità al chiamante)
+        if params:
+            for k, v in params.items():
+                base[k] = v
+
+        return base
+
+    def _get_base_universe_for_selection(
+        self,
+        use_reduced_universe: bool,
+    ) -> List[str]:
+        """
+        Sceglie l'universo di partenza per la selezione combinatoria:
+        U' se use_reduced_universe=True e non vuoto, altrimenti l'universo pieno.
+        """
+        rho = self.current_rho
+        mu_series = self.current_mu
+        assert rho is not None and mu_series is not None
+
+        if use_reduced_universe and self.reduced_universe:
+            base_universe = [
+                t
+                for t in self.reduced_universe
+                if t in rho.columns and t in mu_series.index
+            ]
+        else:
+            base_universe = [
+                t for t in rho.columns if t in mu_series.index
+            ]
+
+        return base_universe
+
+    def _build_selector_inputs(
+        self,
+        universe: List[str],
+    ) -> Tuple[pd.DataFrame, Dict[str, float | None], Dict[str, str | None],
+               Dict[str, bool], Dict[str, float]]:
+        """
+        Costruisce i dizionari (rating_scores, sectors, has_rating, mu_dict)
+        e la rho ridotta all'universo scelto, da passare al PortfolioSelector.
+        """
+        rho = self.current_rho
+        mu_series = self.current_mu
+        assert rho is not None and mu_series is not None
 
         rating_scores: Dict[str, float | None] = {}
         sectors: Dict[str, str | None] = {}
@@ -365,55 +541,324 @@ class Model:
             else:
                 mu_dict[t] = 0.0
 
-        # Rho ridotta all'universo scelto
         rho_sub = rho.loc[universe, universe]
 
-        # ---------- STEP 3: ordinamento candidati (nel Selector) ----------
+        return rho_sub, rating_scores, sectors, has_rating, mu_dict
 
-        candidati = PortfolioSelector.sort_candidates(
-            tickers=universe,
-            rating_scores=rating_scores,
-            has_rating=has_rating,
-            mu=mu_dict,
-        )
+    # GRAFO PER DIJKSTRA
 
-        # ---------- STEP 4: selezione combinatoria ----------
+    def build_graph_for_dijkstra(
+        self,
+        use_reduced_universe: bool = True,
+        signed: bool = False,
+        tau: float | None = None,
+        k: int | None = None,
+    ) -> nx.Graph:
+        """
+        Costruisce e salva in self.current_graph il grafo da usare con Dijkstra.
 
-        selector = PortfolioSelector(
+        Passi:
+        - sceglie l'universo di nodi: U' (self.reduced_universe) oppure l'intero
+          universo di current_rho;
+        - restringe current_rho all'universo scelto;
+        - chiama GraphBuilder.build_filtered_graph con i parametri specificati
+          (signed, tau, k);
+        - aggiorna self.current_graph.
+
+        Parametri:
+            - use_reduced_universe: se True e self.reduced_universe non è vuoto,
+              usa U' come universo di base; altrimenti usa tutte le colonne di current_rho.
+            - signed:
+                * False → distanza = 1 - |rho|
+                * True  → distanza = (1 - rho) / 2
+            - tau: soglia opzionale sulla correlazione in valore assoluto.
+                   Se None, verrà usato il valore da _risk_profile (se presente).
+            - k: parametro opzionale k-NN. Se None, verrà usato il valore
+                 da _risk_profile (se presente).
+        """
+        if self.current_rho is None:
+            raise RuntimeError(
+                "current_rho non disponibile. "
+                "Chiama estimate_risk() prima di build_graph_for_dijkstra()."
+            )
+
+        prof = self._risk_profile or {}
+        # usa graph_tau/graph_k se specifici, altrimenti tau/k generali
+        if tau is None:
+            tau = prof.get("graph_tau", prof.get("tau", None))
+        if k is None:
+            k = prof.get("graph_k", prof.get("k", None))
+
+        rho_full = self.current_rho
+
+        # 1) Scegli l'universo di nodi
+        if use_reduced_universe and self.reduced_universe:
+            base_universe = [
+                t for t in self.reduced_universe
+                if t in rho_full.columns
+            ]
+        else:
+            base_universe = list(rho_full.columns)
+
+        if not base_universe:
+            raise ValueError(
+                "Universo per il grafo di Dijkstra vuoto. "
+                "Controlla current_rho e/o reduced_universe."
+            )
+
+        # 2) Sottocampiona la matrice di correlazione all'universo scelto
+        rho_sub = rho_full.loc[base_universe, base_universe]
+
+        # 3) Costruisci grafo + adj + dist_knn con GraphBuilder
+        G, adj, dist_knn = GraphBuilder.build_filtered_graph(
             rho=rho_sub,
-            rating_scores=rating_scores,
-            sectors=sectors,
-            has_rating=has_rating,
-            mu=mu_dict,
-            params=params,
+            tau=tau,
+            k=k,
+            signed=signed,
         )
-        best_subset, best_score = selector.select(candidati=candidati)
 
-        if best_subset is None or len(best_subset) == 0:
-            # Nessuna soluzione che rispetti i vincoli
-            self.last_portfolio_tickers = []
-            self.last_portfolio_weights = {}
-            self.last_portfolio_score = None
-            return None, {}, None
+        # 4) Salva il grafo nel Model
+        self.current_graph = G
 
-        # ---------- STEP 5: calcolo pesi (solo long) ----------
+        return G
 
-        mode = params.get("weights_mode", "mv")          # "mv" o "eq"
-        risk_aversion = float(params.get("mv_risk_aversion", 1.0))
+    # PORTAFOGLIO VIA DIJKSTRA (MIN CORRELAZIONE DA SOURCE)
 
+    def build_portfolio_dijkstra(
+        self,
+        source: str,
+        K: int,
+        use_reduced_universe: bool = True,
+        require_rating: bool = False,
+        min_rating_score: float = 13.0,
+        rho_pair_max: float | None = None,
+    ) -> Tuple[List[str], Dict[str, float]]:
+        """
+        Costruisce un portafoglio di dimensione K usando Dijkstra sul grafo di correlazione.
+
+        Logica:
+        - usa self.current_graph (costruito da build_reduced_universe o build_graph_for_dijkstra),
+        - definisce un universo ammissibile (U' o tutti i nodi del grafo),
+        - calcola le distanze minime (shortest path) da 'source',
+        - sceglie i titoli con distanza più GRANDE (più decorrelati) rispettando:
+              * opzionale: require_rating + min_rating_score,
+              * opzionale: rho_pair_max rispetto ai titoli già scelti,
+        - calcola i pesi (equal-weight) con PortfolioWeights.
+        """
+        if self.current_graph is None:
+            raise RuntimeError(
+                "current_graph non disponibile. "
+                "Chiama prima build_reduced_universe() o build_graph_for_dijkstra()."
+            )
+
+        if source not in self.current_graph:
+            raise ValueError(f"Ticker source '{source}' non presente nel grafo corrente.")
+
+        if K <= 0:
+            raise ValueError("K deve essere > 0.")
+
+        # Universo base: U' se richiesto e non vuoto, altrimenti tutti i nodi del grafo
+        universe = self._build_dijkstra_universe(
+            source=source,
+            K=K,
+            use_reduced_universe=use_reduced_universe,
+            require_rating=require_rating,
+            min_rating_score=min_rating_score,
+        )
+
+        # Distanze minime dal source usando l'attributo 'distance'
+        lengths = self._compute_dijkstra_distances_from_source(source)
+
+        # Consideriamo solo nodi dell'universo e raggiungibili, escluso il source
+        candidates_dist = [
+            (t, d) for t, d in lengths.items()
+            if t in universe and t != source
+        ]
+
+        if not candidates_dist:
+            # Non ci sono nodi raggiungibili diversi dal source
+            return [source], {source: 1.0}
+
+        # ordina per distanza decrescente (più lontani = più decorrelati)
+        candidates_dist.sort(key=lambda x: x[1], reverse=True)
+
+        # Costruzione portafoglio
+        portfolio: List[str] = [source]
+
+        # Aggiunge titoli finché si arriva a K, rispettando rho_pair_max
+        for t, d in candidates_dist:
+            if len(portfolio) >= K:
+                break
+            if not self._ok_rho_pairwise(portfolio, t, rho_pair_max):
+                continue
+            portfolio.append(t)
+
+        # Se non abbiamo raggiunto K (troppi vincoli), riempiamo ignorando rho_pair_max
+        if len(portfolio) < K:
+            for t, d in candidates_dist:
+                if len(portfolio) >= K:
+                    break
+                if t in portfolio:
+                    continue
+                portfolio.append(t)
+
+        # Calcolo pesi (ottimizzati in MV con avversione al rischio 1.0)
         weights = PortfolioWeights.compute(
-            tickers=list(best_subset),
-            mode=mode,
+            tickers=portfolio,
+            mode="mv",
             mu=self.current_mu,
             Sigma_sh=self.current_Sigma_sh,
-            risk_aversion=risk_aversion,
+            risk_aversion=1.0,
         )
 
-        self.last_portfolio_tickers = list(best_subset)
-        self.last_portfolio_weights = weights
-        self.last_portfolio_score = float(best_score)
+        return portfolio, weights
 
-        return list(best_subset), weights, float(best_score)
+    def _build_dijkstra_universe(
+        self,
+        source: str,
+        K: int,
+        use_reduced_universe: bool,
+        require_rating: bool,
+        min_rating_score: float,
+    ) -> set[str]:
+        """
+        Applica tutti i filtri sull'universo per il portafoglio Dijkstra
+        (U' vs universo pieno, rating minimo, ecc.).
+        """
+        if use_reduced_universe and self.reduced_universe:
+            universe = set(self.reduced_universe)
+        else:
+            universe = set(self.current_graph.nodes)
+
+        # Il source deve sempre essere incluso nell'universo
+        if source not in universe:
+            universe.add(source)
+
+        # Eventuale vincolo di rating
+        if require_rating:
+            filtered_universe = set()
+            for t in universe:
+                stock = self.stocks.get(t)
+                if stock is None:
+                    continue
+                rs = stock.rating_score
+                if rs is not None and rs >= min_rating_score:
+                    filtered_universe.add(t)
+            # assicuriamoci di non perdere il source
+            stock_src = self.stocks.get(source)
+            if (
+                stock_src is None
+                or stock_src.rating_score is None
+                or stock_src.rating_score < min_rating_score
+            ):
+                # forza l'inclusione del source anche se non rispetta il rating
+                filtered_universe.add(source)
+
+            universe = filtered_universe
+
+        if len(universe) < K:
+            raise ValueError(
+                f"Universo disponibile ({len(universe)}) troppo piccolo per K={K}."
+            )
+
+        return universe
+
+    def _compute_dijkstra_distances_from_source(self, source: str) -> Dict[str, float]:
+        """
+        Calcola le distanze minime da 'source' usando l'attributo 'distance'
+        (se presente) oppure 'weight' come fallback.
+        """
+        assert self.current_graph is not None
+
+        use_attr = "distance"
+        any_edge = next(iter(self.current_graph.edges(data=True)), None)
+        if any_edge is not None and "distance" not in any_edge[2]:
+            use_attr = "weight"
+
+        lengths: Dict[str, float] = nx.single_source_dijkstra_path_length(
+            self.current_graph,
+            source,
+            weight=use_attr,
+        )
+        return lengths
+
+    def _ok_rho_pairwise(
+        self,
+        portfolio: List[str],
+        new_t: str,
+        rho_pair_max: float | None,
+    ) -> bool:
+        """
+        Controlla il vincolo di correlazione massima in valore assoluto
+        tra il nuovo titolo e quelli già in portafoglio.
+        """
+        if rho_pair_max is None or self.current_rho is None:
+            return True
+
+        rho_max_val = float(rho_pair_max)
+        for t in portfolio:
+            if (
+                t not in self.current_rho.index
+                or new_t not in self.current_rho.columns
+            ):
+                continue
+            cij = self.current_rho.loc[t, new_t]
+            if pd.notna(cij) and abs(cij) > rho_max_val:
+                return False
+        return True
+
+    # WRAPPER ALTO LIVELLO: COSTRUISCI GRAFO + PORTAFOGLIO (DIJKSTRA)
+
+    def build_dijkstra_portfolio(
+        self,
+        source: str,
+        K: int,
+        use_reduced_universe: bool = True,
+        require_rating: bool = False,
+        min_rating_score: float = 13.0,
+        rho_pair_max: float | None = None,
+        graph_signed: bool = False,
+        graph_tau: float | None = None,
+        graph_k: int | None = None,
+    ) -> Tuple[List[str], Dict[str, float]]:
+        """
+        Metodo di alto livello che:
+        1) costruisce il grafo da usare con Dijkstra (build_graph_for_dijkstra),
+        2) esegue build_portfolio_dijkstra per ottenere il portafoglio.
+
+        Parametri:
+            - source: ticker sorgente da cui calcolare le distanze minime.
+            - K: dimensione del portafoglio.
+            - use_reduced_universe: se True prova a usare U' (reduced_universe)
+              come universo di base, sia per il grafo sia per il portafoglio.
+            - require_rating, min_rating_score, rho_pair_max:
+              passati tali e quali a build_portfolio_dijkstra.
+            - graph_signed, graph_tau, graph_k:
+              parametri per la costruzione del grafo:
+                * graph_signed=False → distanza = 1 - |rho|
+                * graph_signed=True  → distanza = (1 - rho)/2
+                * graph_tau: soglia di correlazione (None = nessuna soglia)
+                * graph_k: k-NN (None = nessun filtro k-NN)
+        """
+        # 1) costruzione/aggiornamento del grafo per Dijkstra
+        self.build_graph_for_dijkstra(
+            use_reduced_universe=use_reduced_universe,
+            signed=graph_signed,
+            tau=graph_tau,
+            k=graph_k,
+        )
+
+        # 2) costruzione del portafoglio tramite Dijkstra
+        portfolio, weights = self.build_portfolio_dijkstra(
+            source=source,
+            K=K,
+            use_reduced_universe=use_reduced_universe,
+            require_rating=require_rating,
+            min_rating_score=min_rating_score,
+            rho_pair_max=rho_pair_max,
+        )
+
+        return portfolio, weights
 
 
 if __name__ == "__main__":
@@ -424,9 +869,7 @@ if __name__ == "__main__":
     model = Model()
 
     try:
-        # ============================
         # STEP 1: caricamento dati
-        # ============================
         model.load_data_from_dao()
 
         print("=== TEST MODEL (Step 1: load_data_from_dao) ===")
@@ -442,9 +885,7 @@ if __name__ == "__main__":
         if len(model.stocks) == 0:
             raise AssertionError("model.stocks è vuoto.")
 
-        # ============================
         # STEP 2: stima rischio su tutta la storia
-        # ============================
         print("\n=== TEST MODEL (Step 2: estimate_risk) ===")
         model.estimate_risk(shrink_lambda=0.1)
 
@@ -459,9 +900,7 @@ if __name__ == "__main__":
         if rho is None or Sigma_sh is None or mu is None:
             raise AssertionError("Le matrici di rischio correnti non sono state stimate.")
 
-        # ============================
         # STEP 3: costruzione universo ridotto U'
-        # ============================
         print("\n=== TEST MODEL (Step 3: build_reduced_universe) ===")
         reduced = model.build_reduced_universe(
             tau=0.3,
@@ -492,9 +931,7 @@ if __name__ == "__main__":
     else:
         print("\nTEST MODEL STEP 1–3 OK.")
 
-        # ============================
         # STEP 5–6: optimize_portfolio + pesi
-        # ============================
         print("\n=== TEST MODEL (Step 5–6: optimize_portfolio + weights) ===")
 
         if model.reduced_universe:
@@ -503,7 +940,7 @@ if __name__ == "__main__":
             print("Attenzione: reduced_universe è vuoto, userò l'universo completo (current_rho.columns).")
 
         params = PortfolioSelector.build_default_params()
-        params["K"] = 5
+        params["K"] = 4
         params["max_unrated_share"] = 0.2
         params["rating_min"] = 13.0
         params["max_share_per_sector"] = 0.5
@@ -544,3 +981,30 @@ if __name__ == "__main__":
                 print("Pesi assegnati:")
                 print(weights)
                 print("Somma pesi:", sum(weights.values()))
+
+                # TEST DIJKSTRA (min-corr da un ticker del portafoglio ottimo)
+                print("\n=== TEST MODEL (Dijkstra min-corr da source nel portafoglio ottimo) ===")
+
+                # scegliamo come source il titolo con peso più alto nel portafoglio ottimo
+                source = max(weights, key=weights.get)
+                print(f"Ticker source scelto dal portafoglio ottimo: {source}")
+
+                t0_d = time.time()
+                try:
+                    port_dij, w_dij = model.build_dijkstra_portfolio(
+                        source=source,
+                        K=len(best_subset),      # stesso K del portafoglio ottimo
+                        use_reduced_universe=True,
+                        require_rating=False,
+                        rho_pair_max=0.8,
+                    )
+                except Exception:
+                    t1_d = time.time()
+                    print(f"ERRORE durante build_portfolio_dijkstra dopo {t1_d - t0_d:.2f} secondi:")
+                    traceback.print_exc()
+                else:
+                    t1_d = time.time()
+                    print(f"build_portfolio_dijkstra terminato in {t1_d - t0_d:.2f} secondi.\n")
+                    print("Portafoglio Dijkstra:", port_dij)
+                    print("Pesi Dijkstra:", w_dij)
+                    print("Somma pesi:", sum(w_dij.values()))
