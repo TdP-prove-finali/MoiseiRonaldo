@@ -839,13 +839,15 @@ class Model:
 
     # SIMULAZIONI MONTE CARLO
 
+    # MONTE CARLO
+
     def simulate_portfolio_paths(
-        self,
-        tickers: list[str],
-        weights: dict[str, float],
-        n_paths: int = 100,
-        n_days: int = 252,
-        seed: int | None = None,
+            self,
+            tickers: list[str],
+            weights: dict[str, float],
+            n_paths: int = 100,
+            n_days: int = 252,
+            seed: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Simula traiettorie di valore di portafoglio in un modello gaussiano
@@ -869,6 +871,7 @@ class Model:
         w_vec = np.array([weights.get(t, 0.0) for t in tickers], dtype=float)
         if w_vec.sum() <= 0:
             raise ValueError("Somma pesi nulla nel portafoglio da simulare.")
+        # normalizzazione pesi
         w_vec = w_vec / w_vec.sum()
 
         # allineo mu e Sigma_sh all'universo dei tickers
@@ -876,7 +879,7 @@ class Model:
         missing_S = [
             t for t in tickers
             if t not in self.current_Sigma_sh.index
-            or t not in self.current_Sigma_sh.columns
+               or t not in self.current_Sigma_sh.columns
         ]
         if missing_mu or missing_S:
             raise ValueError(
@@ -884,40 +887,63 @@ class Model:
                 f"missing_mu={missing_mu}, missing_S={missing_S}"
             )
 
+        # estrazione sottovettori/sottomatrici
         mu_vec = self.current_mu.loc[tickers].astype(float).values  # (K,)
         Sigma_sub = self.current_Sigma_sh.loc[tickers, tickers].astype(float).values
 
-        # rendimento atteso e varianza del portafoglio
+        # calcolo rendimento atteso e varianza del portafoglio (mu_p, var_p)
         mu_p = float(w_vec @ mu_vec)
         var_p = float(w_vec @ Sigma_sub @ w_vec)
         sigma_p = np.sqrt(var_p) if var_p > 0 else 0.0
 
         # processo lognormale su rendimenti log
-        if seed is not None:
-            rng = np.random.default_rng(seed)
-        else:
-            rng = np.random.default_rng()
+        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
 
-        # shape (n_paths, n_days)
+        # SIMULAZIONE SHOCKS: (n_paths, n_days)
         shocks = rng.normal(loc=mu_p, scale=sigma_p, size=(n_paths, n_days))
-        # valori cumulati (partenza 0 in log → valore 1 in livello)
+
+        # VALORI CUMULATI (partenza 0 in log → valore 1 in livello)
         log_paths = np.concatenate(
             [np.zeros((n_paths, 1)), np.cumsum(shocks, axis=1)],
             axis=1,
         )
-        paths = np.exp(log_paths)  # parte da 1.0
+        paths = np.exp(log_paths)  # shape (n_paths, n_days+1), parte da 1.0
 
         # traiettoria media
         mean_path = paths.mean(axis=0)
 
         return paths, mean_path
 
+    def _summarize_mc_paths(self, paths: np.ndarray) -> dict[str, float]:
+        """
+        Calcola statistiche riassuntive sulle traiettorie Monte Carlo.
+        """
+        if paths is None or paths.size == 0:
+            raise ValueError("Array paths vuoto in _summarize_mc_paths.")
+
+        final_vals = paths[:, -1]  # valore a fine orizzonte (partenza 1.0)
+        mean_final = float(final_vals.mean())
+        std_final = float(final_vals.std(ddof=0))
+        # calcolo percentili
+        p5, p50, p95 = np.percentile(final_vals, [5, 50, 95])
+        # probabilità di perdita (valore finale < 1.0)
+        prob_loss = float((final_vals < 1.0).mean())
+
+        return {
+            "mean_final": mean_final,
+            "std_final": std_final,
+            "p5": float(p5),
+            "p50": float(p50),
+            "p95": float(p95),
+            "prob_loss": prob_loss,
+        }
+
     def simulate_mc_for_last_portfolios(
-        self,
-        n_paths: int = 100,
-        n_days: int = 252,
-        seed_bb: int = 42,
-        seed_dij: int = 99,
+            self,
+            n_paths: int = 100,
+            n_days: int = 252,
+            seed_bb: int = 42,
+            seed_dij: int = 99,
     ) -> dict[str, dict[str, np.ndarray]]:
         """
         Esegue la simulazione Monte Carlo per:
@@ -926,11 +952,19 @@ class Model:
 
         Restituisce un dizionario:
             {
-                "bb": {"paths": ..., "mean": ...},
-                "dij": {"paths": ..., "mean": ...}
+                "bb": {
+                    "paths":    np.ndarray,
+                    "mean":     np.ndarray,
+                    "summary": {...}
+                },
+                "dij": {
+                    "paths":    np.ndarray,
+                    "mean":     np.ndarray,
+                    "summary": {...}
+                }
             }
         """
-        # portafoglio B&B
+        # PORTAFOGLIO BRANCH & BOUND (BB)
         if not self.last_portfolio_tickers or not self.last_portfolio_weights:
             raise RuntimeError(
                 "Portafoglio B&B non disponibile. "
@@ -940,6 +974,7 @@ class Model:
         tickers_bb = list(self.last_portfolio_tickers)
         weights_bb = dict(self.last_portfolio_weights)
 
+        # simulazione BB
         paths_bb, mean_bb = self.simulate_portfolio_paths(
             tickers=tickers_bb,
             weights=weights_bb,
@@ -947,9 +982,12 @@ class Model:
             n_days=n_days,
             seed=seed_bb,
         )
+        summary_bb = self._summarize_mc_paths(paths_bb)
 
-        # portafoglio Dijkstra
-        if not self.last_dij_tickers or not self.last_dij_weights:
+        # PORTAFOGLIO DIJKSTRA (DIJ)
+        # Assumiamo che il Model salvi i risultati di Dijkstra in self.last_dij_tickers/weights
+        if not hasattr(self, "last_dij_tickers") or not hasattr(self, "last_dij_weights"):
+            # controllo per assicurare che i dati esistano prima di chiamare
             raise RuntimeError(
                 "Portafoglio Dijkstra non disponibile. "
                 "Esegui prima build_dijkstra_portfolio dal Controller."
@@ -958,6 +996,13 @@ class Model:
         tickers_dij = list(self.last_dij_tickers)
         weights_dij = dict(self.last_dij_weights)
 
+        if not tickers_dij or not weights_dij:
+            raise RuntimeError(
+                "Portafoglio Dijkstra vuoto. "
+                "Esegui prima build_dijkstra_portfolio dal Controller."
+            )
+
+        # simulazione Dijkstra
         paths_dij, mean_dij = self.simulate_portfolio_paths(
             tickers=tickers_dij,
             weights=weights_dij,
@@ -965,10 +1010,12 @@ class Model:
             n_days=n_days,
             seed=seed_dij,
         )
+        summary_dij = self._summarize_mc_paths(paths_dij)
 
+        # RITORNO DEI RISULTATI
         return {
-            "bb": {"paths": paths_bb, "mean": mean_bb},
-            "dij": {"paths": paths_dij, "mean": mean_dij},
+            "bb": {"paths": paths_bb, "mean": mean_bb, "summary": summary_bb},
+            "dij": {"paths": paths_dij, "mean": mean_dij, "summary": summary_dij},
         }
 
 

@@ -4,6 +4,9 @@ from typing import Any, Dict, Tuple
 
 import flet as ft
 import numpy as np
+import io
+import base64
+import matplotlib.pyplot as plt
 
 from model.selector import PortfolioSelector
 
@@ -567,26 +570,49 @@ class Controller:
                 n_days=n_days,
             )
 
-            # per ogni portafoglio (B&B e Dijkstra) calcolo statistiche sui valori finali
+            # recupero paths e medie per plot
+            data_bb = results.get("bb")
+            data_dij = results.get("dij")
+
+            if not data_bb or not data_dij:
+                lv.controls.append(
+                    ft.Text("Risultati Monte Carlo incompleti (mancano B&B o Dijkstra).")
+                )
+                self._view.update_page()
+                return
+
+            paths_bb = data_bb["paths"]  # shape (n_paths, n_days+1)
+            mean_bb = data_bb["mean"]  # shape (n_days+1,)
+            paths_dij = data_dij["paths"]
+            mean_dij = data_dij["mean"]
+
+            # statistiche finali: uso summary se presente, altrimenti ricalcolo
             for key, label in [("bb", "B&B"), ("dij", "Dijkstra")]:
                 data = results.get(key)
                 if not data:
                     continue
 
-                paths = data["paths"]      # shape (n_paths, n_days+1)
-                mean_path = data["mean"]   # shape (n_days+1,)
-
+                paths = data["paths"]
                 if paths is None or paths.size == 0:
                     lv.controls.append(
                         ft.Text(f"Portafoglio {label}: nessun percorso simulato.")
                     )
                     continue
 
-                final_vals = paths[:, -1]  # valore a fine orizzonte (partenza 1.0)
-                mean_final = float(final_vals.mean())
-                std_final = float(final_vals.std(ddof=0))
-                p5, p50, p95 = np.percentile(final_vals, [5, 50, 95])
-                prob_loss = float((final_vals < 1.0).mean())
+                summary = data.get("summary")
+                if summary is None:
+                    final_vals = paths[:, -1]
+                    mean_final = float(final_vals.mean())
+                    std_final = float(final_vals.std(ddof=0))
+                    p5, p50, p95 = np.percentile(final_vals, [5, 50, 95])
+                    prob_loss = float((final_vals < 1.0).mean())
+                else:
+                    mean_final = summary["mean_final"]
+                    std_final = summary["std_final"]
+                    p5 = summary["p5"]
+                    p50 = summary["p50"]
+                    p95 = summary["p95"]
+                    prob_loss = summary["prob_loss"]
 
                 lv.controls.append(ft.Text(f"--- Portafoglio {label} ---"))
                 lv.controls.append(
@@ -608,10 +634,91 @@ class Controller:
                     )
                 )
 
+            # grafico con traiettorie (verde = B&B, blu = Dijkstra)
+            lv.controls.append(ft.Text(""))
+            lv.controls.append(
+                ft.Text("Grafico simulazioni Monte Carlo (verde=B&B, blu=Dijkstra):")
+            )
+
+            img = self._build_mc_figure_image(
+                paths_bb=paths_bb,
+                mean_bb=mean_bb,
+                paths_dij=paths_dij,
+                mean_dij=mean_dij,
+                years=years,
+                n_show_paths=10,  # numero di traiettorie per tipo da mostrare
+            )
+            lv.controls.append(img)
+
             self._view.update_page()
 
         except Exception as ex:
             self._show_error(f"Errore simulazione Monte Carlo: {ex}", target="mc")
+
+    def _build_mc_figure_image(
+        self,
+        paths_bb: np.ndarray,
+        mean_bb: np.ndarray,
+        paths_dij: np.ndarray,
+        mean_dij: np.ndarray,
+        years: int,
+        n_show_paths: int = 10,
+    ) -> ft.Image:
+        """
+        Crea una figura matplotlib con:
+        - alcune traiettorie B&B (verde chiaro) e Dijkstra (blu chiaro),
+        - le traiettorie medie B&B (verde scuro) e Dijkstra (blu scuro),
+        - baseline a 1.0.
+
+        Restituisce un ft.Image con PNG codificato in base64.
+        """
+        # sicurezza su dimensioni
+        if paths_bb is None or paths_bb.size == 0:
+            raise ValueError("paths_bb vuoto in _build_mc_figure_image.")
+        if paths_dij is None or paths_dij.size == 0:
+            raise ValueError("paths_dij vuoto in _build_mc_figure_image.")
+
+        n_paths_bb, T_bb = paths_bb.shape
+        n_paths_dij, T_dij = paths_dij.shape
+        T = min(T_bb, T_dij)
+
+        # orizzonte in anni sull'asse x (giorni/252)
+        x = np.arange(T) / 252.0
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+
+        # numero di percorsi da plottare
+        n_plot_bb = min(n_show_paths, n_paths_bb)
+        n_plot_dij = min(n_show_paths, n_paths_dij)
+
+        # traiettorie B&B – verde chiaro
+        for i in range(n_plot_bb):
+            ax.plot(x, paths_bb[i, :T], color="green", alpha=0.15, linewidth=0.7)
+
+        # traiettorie Dijkstra – blu chiaro
+        for i in range(n_plot_dij):
+            ax.plot(x, paths_dij[i, :T], color="blue", alpha=0.15, linewidth=0.7)
+
+        # traiettorie medie
+        ax.plot(x, mean_bb[:T], color="green", linewidth=2.0, label="B&B – media")
+        ax.plot(x, mean_dij[:T], color="blue", linewidth=2.0, label="Dijkstra – media")
+
+        # baseline a 1.0
+        ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.0, alpha=0.7)
+
+        ax.set_title(f"Monte Carlo – orizzonte {years} anni")
+        ax.set_xlabel("Tempo (anni)")
+        ax.set_ylabel("Valore portafoglio (base 1.0)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+
+        img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return ft.Image(src_base64=img_b64, width=650)
 
     # HELPER LETTURA INPUT
 
@@ -876,3 +983,96 @@ class Controller:
         lv.controls.clear()
         lv.controls.append(ft.Text(message, color="red"))
         self._view.update_page()
+if __name__ == "__main__":
+    # Test manuale per verificare che handle_montecarlo
+    # aggiunga un grafico (ft.Image) alla ListView txt_result_mc.
+
+    class DummySlider:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+    class DummyView:
+        def __init__(self) -> None:
+            # ListView per output Monte Carlo
+            self.txt_result_mc: ft.ListView | None = ft.ListView(expand=True)
+
+            # Campo opzionale per numero di paths (lo lasciamo None → usa default)
+            self.txt_mc_n_paths: ft.TextField | None = None
+
+            # Slider: anni, rischio, max_unrated
+            # sld_years: indice 0..3 → [5, 10, 20, 30] anni
+            self.sld_years = DummySlider(1.0)        # → 10 anni
+            self.sld_risk = DummySlider(2.0)         # livello rischio "medio"
+            self.sld_max_unrated = DummySlider(1.0)  # 0.25
+
+            # Altri attributi usati da _show_error, ma non servono qui
+            self.txt_result_opt: ft.ListView | None = ft.ListView(expand=True)
+            self.txt_result_dij: ft.ListView | None = ft.ListView(expand=True)
+
+        def update_page(self) -> None:
+            # Nel test non serve fare nulla: nessun rendering reale
+            pass
+
+        def enable_montecarlo(self, _flag: bool) -> None:
+            # Stub: nel test non serve
+            pass
+
+    class DummyModel:
+        """
+        Modello fittizio che restituisce traiettorie randomiche
+        per B&B e Dijkstra, con la stessa struttura prevista
+        da simulate_mc_for_last_portfolios.
+        """
+
+        def simulate_mc_for_last_portfolios(
+                self,
+                n_paths: int,
+                n_days: int,
+                seed_bb: int = 42,
+                seed_dij: int = 99,
+        ) -> dict[str, dict[str, np.ndarray]]:
+            rng_bb = np.random.default_rng(seed_bb)
+            rng_dij = np.random.default_rng(seed_dij)
+
+            # Simulazioni lognormali fittizie
+            shocks_bb = rng_bb.normal(loc=0.0005, scale=0.01, size=(n_paths, n_days))
+            shocks_dij = rng_dij.normal(loc=0.0006, scale=0.011, size=(n_paths, n_days))
+
+            log_paths_bb = np.concatenate(
+                [np.zeros((n_paths, 1)), np.cumsum(shocks_bb, axis=1)],
+                axis=1,
+            )
+            log_paths_dij = np.concatenate(
+                [np.zeros((n_paths, 1)), np.cumsum(shocks_dij, axis=1)],
+                axis=1,
+            )
+
+            paths_bb = np.exp(log_paths_bb)
+            paths_dij = np.exp(log_paths_dij)
+
+            mean_bb = paths_bb.mean(axis=0)
+            mean_dij = paths_dij.mean(axis=0)
+
+            return {
+                "bb": {"paths": paths_bb, "mean": mean_bb},
+                "dij": {"paths": paths_dij, "mean": mean_dij},
+            }
+
+    # Istanzia Controller con view e model fittizi
+    dummy_view = DummyView()
+    dummy_model = DummyModel()
+    controller = Controller(dummy_view, dummy_model)
+
+    # Esegui l'handler Monte Carlo come se fosse premuto il bottone
+    controller.handle_montecarlo(e=None)
+
+    # Verifica: deve esserci almeno una ft.Image tra i controls della ListView
+    lv = dummy_view.txt_result_mc
+    has_image = any(isinstance(c, ft.Image) for c in lv.controls)
+
+    if not has_image:
+        raise AssertionError(
+            "TEST handle_montecarlo FALLITO: nessuna immagine trovata in txt_result_mc.controls."
+        )
+
+    print("TEST handle_montecarlo OK: immagine (plot) trovata in txt_result_mc.controls.")
