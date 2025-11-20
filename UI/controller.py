@@ -17,6 +17,25 @@ class Controller:
         self._view = view
         self._model = model
 
+    def handle_reset(self, e: ft.ControlEvent) -> None:
+        """
+        Reset completo dell'interfaccia ai valori di default per una nuova simulazione.
+        Non ricarica i dati dal DAO ma riporta i controlli allo stato iniziale.
+        """
+        try:
+            # reset eventuale stato interno del modello, se previsto
+            if hasattr(self._model, "reset_state"):
+                try:
+                    self._model.reset_state()
+                except Exception:
+                    # ignora eventuali errori nel reset opzionale del modello
+                    pass
+
+            if hasattr(self._view, "reset_ui"):
+                self._view.reset_ui()
+        except Exception as ex:
+            self._show_error(f"Errore nel reset: {ex}", target="opt")
+
     # HANDLER: COSTRUZIONE UNIVERSO RIDOTTO U' (log su pannello ottimizzazione)
 
     def handle_build_universe(self, e: ft.ControlEvent) -> None:
@@ -983,6 +1002,8 @@ class Controller:
         lv.controls.clear()
         lv.controls.append(ft.Text(message, color="red"))
         self._view.update_page()
+
+
 if __name__ == "__main__":
     # Test manuale per verificare che handle_montecarlo
     # aggiunga un grafico (ft.Image) alla ListView txt_result_mc.

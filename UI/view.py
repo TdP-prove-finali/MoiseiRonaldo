@@ -18,6 +18,7 @@ class View(ft.UserControl):
         self._controller = None
 
         self._theme_switch: ft.Switch | None = None
+        self._btn_reset: ft.ElevatedButton | None = None
 
         # campi di input per dati generali
         self._txt_capital: ft.TextField | None = None
@@ -86,7 +87,7 @@ class View(ft.UserControl):
         self.txt_result_mc: ft.ListView | None = None       # risultati Monte Carlo
 
     def load_interface(self) -> None:
-        # HEADER: tema + titolo
+        # HEADER: tema + titolo + reset
         self._theme_switch = ft.Switch(
             label="Dark theme",
             value=True,
@@ -99,12 +100,24 @@ class View(ft.UserControl):
             size=24,
         )
 
+        self._btn_reset = ft.ElevatedButton(
+            text="Reset",
+            icon=ft.icons.RESTART_ALT,
+            on_click=lambda e: (
+                self._controller.handle_reset(e)
+                if self._controller is not None
+                else None
+            ),
+            tooltip="Torna alle impostazioni iniziali per una nuova simulazione",
+        )
+
         header_row = ft.Row(
             controls=[
                 self._theme_switch,
                 ft.Container(expand=True),
                 title_txt,
                 ft.Container(expand=True),
+                self._btn_reset,
             ],
             alignment=ft.MainAxisAlignment.CENTER,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -748,6 +761,106 @@ class View(ft.UserControl):
         if self._dij_adv_panel is None:
             return
         self._dij_adv_panel.visible = not self._dij_adv_panel.visible
+        self._page.update()
+
+    # RESET COMPLETO UI
+    def reset_ui(self) -> None:
+        # input base
+        if self._txt_capital is not None:
+            self._txt_capital.value = ""
+        if self._txt_k is not None:
+            self._txt_k.value = ""
+
+        # slider default (10 anni, rischio 2, max unrated 25%)
+        if self._sld_years is not None:
+            self._sld_years.value = 1
+        if self._sld_risk is not None:
+            self._sld_risk.value = 2
+        if self._sld_max_unrated is not None:
+            self._sld_max_unrated.value = 1
+
+        # aggiorna etichette + date MonteCarlo con nuova base date
+        self._mc_base_date = date.today()
+        self._on_years_change()
+        self._on_risk_change()
+        self._on_unrated_change()
+
+        # parametri avanzati U'
+        for f in (self._txt_tau, self._txt_k_knn, self._txt_max_size):
+            if f is not None:
+                f.value = ""
+        if self._universe_adv_panel is not None:
+            self._universe_adv_panel.visible = False
+
+        # parametri avanzati B&B
+        for f in (
+            self._txt_opt_rating_min,
+            self._txt_opt_max_unrated,
+            self._txt_opt_rho_pair_max,
+            self._txt_opt_max_sector,
+            self._txt_opt_alpha,
+            self._txt_opt_beta,
+            self._txt_opt_gamma,
+            self._txt_opt_delta,
+            self._txt_opt_mv_risk_aversion,
+        ):
+            if f is not None:
+                f.value = ""
+        if self._opt_adv_panel is not None:
+            self._opt_adv_panel.visible = False
+
+        # parametri Dijkstra
+        if self._txt_source is not None:
+            self._txt_source.value = ""
+        if self._chk_dij_use_reduced is not None:
+            self._chk_dij_use_reduced.value = True
+            self._chk_dij_use_reduced.disabled = True
+        if self._chk_dij_require_rating is not None:
+            self._chk_dij_require_rating.value = False
+        if self._chk_dij_signed is not None:
+            self._chk_dij_signed.value = False
+
+        for f in (
+            self._txt_dij_tau,
+            self._txt_dij_k,
+            self._txt_dij_rho_pair_max,
+            self._txt_dij_rating_min,
+        ):
+            if f is not None:
+                f.value = ""
+        if self._dij_adv_panel is not None:
+            self._dij_adv_panel.visible = False
+
+        # Monte Carlo
+        if self._txt_mc_n_paths is not None:
+            self._txt_mc_n_paths.value = ""
+
+        # risultati
+        if self.txt_result_opt is not None:
+            self.txt_result_opt.controls.clear()
+        if self.txt_result_dij is not None:
+            self.txt_result_dij.controls.clear()
+        if self.txt_result_mc is not None:
+            self.txt_result_mc.controls.clear()
+
+        # abilitazione pulsanti
+        if self._btn_build_u is not None:
+            self._btn_build_u.disabled = False
+        if self._btn_build_u_adv is not None:
+            self._btn_build_u_adv.disabled = False
+        if self._btn_optimize is not None:
+            self._btn_optimize.disabled = True
+        if self._btn_optimize_adv is not None:
+            self._btn_optimize_adv.disabled = True
+        if self._btn_dijkstra is not None:
+            self._btn_dijkstra.disabled = True
+        if self._btn_dijkstra_adv is not None:
+            self._btn_dijkstra_adv.disabled = True
+        if self._txt_source is not None:
+            self._txt_source.disabled = True
+        if self._btn_mc_sim is not None:
+            self._btn_mc_sim.disabled = True
+
         self._page.update()
 
     # getter rapidi per il controller
