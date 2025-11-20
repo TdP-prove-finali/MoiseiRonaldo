@@ -1098,7 +1098,7 @@ if __name__ == "__main__":
             print("Attenzione: reduced_universe è vuoto, userò l'universo completo (current_rho.columns).")
 
         params = PortfolioSelector.build_default_params()
-        params["K"] = 4
+        params["K"] = 6
         params["max_unrated_share"] = 0.2
         params["rating_min"] = 13.0
         params["max_share_per_sector"] = 0.5
