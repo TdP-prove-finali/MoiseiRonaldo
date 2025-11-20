@@ -75,6 +75,7 @@ class View(ft.UserControl):
 
         # Monte Carlo
         self._btn_mc_sim: ft.ElevatedButton | None = None
+        self._txt_mc_n_paths: ft.TextField | None = None
         self._txt_mc_start: ft.TextField | None = None
         self._txt_mc_end: ft.TextField | None = None
         self._mc_base_date = None  # data "oggi" fissata alla creazione UI
@@ -555,6 +556,12 @@ class View(ft.UserControl):
                 else None
             ),
         )
+        self._txt_mc_n_paths = ft.TextField(
+            label="Numero traiettorie MC",
+            width=180,
+            hint_text="es. 100",
+            text_align=ft.TextAlign.RIGHT,
+        )
         self._txt_mc_start = ft.TextField(
             label="Data inizio (YYYY-MM-DD)",
             width=180,
@@ -569,6 +576,7 @@ class View(ft.UserControl):
         row_mc = ft.Row(
             controls=[
                 self._btn_mc_sim,
+                self._txt_mc_n_paths,
                 self._txt_mc_start,
                 self._txt_mc_end,
             ],
@@ -719,6 +727,11 @@ class View(ft.UserControl):
             self._chk_dij_use_reduced.disabled = not enabled
         self._page.update()
 
+    def enable_montecarlo(self, enabled: bool) -> None:
+        if self._btn_mc_sim is not None:
+            self._btn_mc_sim.disabled = not enabled
+        self._page.update()
+
     def toggle_universe_advanced_panel(self) -> None:
         if self._universe_adv_panel is None:
             return
@@ -785,6 +798,10 @@ class View(ft.UserControl):
     @property
     def txt_mc_end(self) -> ft.TextField:
         return self._txt_mc_end
+
+    @property
+    def txt_mc_n_paths(self) -> ft.TextField:
+        return self._txt_mc_n_paths
 
     # getter per parametri avanzati B&B
     @property

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, List, Any, Tuple
 
+import numpy as np
 import pandas as pd
 import networkx as nx
 
@@ -25,6 +26,8 @@ class Model:
         - applica filtri (soglia, k-NN) e costruisce un universo ridotto U'
         - delega la selezione combinatoria del portafoglio a PortfolioSelector
         - calcola i pesi (PortfolioWeights)
+        - costruisce un portafoglio min-correlazione via Dijkstra
+        - esegue simulazioni Monte Carlo sugli ultimi portafogli trovati
     """
 
     def __init__(self, dao: Optional[DAO] = None) -> None:
@@ -54,10 +57,14 @@ class Model:
         # Universo usato dal selettore (dopo pre-filtro quantitativo)
         self.selector_universe: List[str] = []
 
-        # Risultati ultima ottimizzazione
+        # Risultati ultima ottimizzazione B&B
         self.last_portfolio_tickers: List[str] = []
         self.last_portfolio_weights: Dict[str, float] = {}
         self.last_portfolio_score: float | None = None
+
+        # Risultati ultimo portafoglio Dijkstra
+        self.last_dij_tickers: List[str] = []
+        self.last_dij_weights: Dict[str, float] = {}
 
         # Profilo di rischio corrente (parametri "globali" per grafi e selettore)
         self._risk_profile: Dict[str, Any] | None = None
@@ -564,17 +571,6 @@ class Model:
         - chiama GraphBuilder.build_filtered_graph con i parametri specificati
           (signed, tau, k);
         - aggiorna self.current_graph.
-
-        Parametri:
-            - use_reduced_universe: se True e self.reduced_universe non è vuoto,
-              usa U' come universo di base; altrimenti usa tutte le colonne di current_rho.
-            - signed:
-                * False → distanza = 1 - |rho|
-                * True  → distanza = (1 - rho) / 2
-            - tau: soglia opzionale sulla correlazione in valore assoluto.
-                   Se None, verrà usato il valore da _risk_profile (se presente).
-            - k: parametro opzionale k-NN. Se None, verrà usato il valore
-                 da _risk_profile (se presente).
         """
         if self.current_rho is None:
             raise RuntimeError(
@@ -635,15 +631,6 @@ class Model:
     ) -> Tuple[List[str], Dict[str, float]]:
         """
         Costruisce un portafoglio di dimensione K usando Dijkstra sul grafo di correlazione.
-
-        Logica:
-        - usa self.current_graph (costruito da build_reduced_universe o build_graph_for_dijkstra),
-        - definisce un universo ammissibile (U' o tutti i nodi del grafo),
-        - calcola le distanze minime (shortest path) da 'source',
-        - sceglie i titoli con distanza più GRANDE (più decorrelati) rispettando:
-              * opzionale: require_rating + min_rating_score,
-              * opzionale: rho_pair_max rispetto ai titoli già scelti,
-        - calcola i pesi (equal-weight) con PortfolioWeights.
         """
         if self.current_graph is None:
             raise RuntimeError(
@@ -825,20 +812,6 @@ class Model:
         Metodo di alto livello che:
         1) costruisce il grafo da usare con Dijkstra (build_graph_for_dijkstra),
         2) esegue build_portfolio_dijkstra per ottenere il portafoglio.
-
-        Parametri:
-            - source: ticker sorgente da cui calcolare le distanze minime.
-            - K: dimensione del portafoglio.
-            - use_reduced_universe: se True prova a usare U' (reduced_universe)
-              come universo di base, sia per il grafo sia per il portafoglio.
-            - require_rating, min_rating_score, rho_pair_max:
-              passati tali e quali a build_portfolio_dijkstra.
-            - graph_signed, graph_tau, graph_k:
-              parametri per la costruzione del grafo:
-                * graph_signed=False → distanza = 1 - |rho|
-                * graph_signed=True  → distanza = (1 - rho)/2
-                * graph_tau: soglia di correlazione (None = nessuna soglia)
-                * graph_k: k-NN (None = nessun filtro k-NN)
         """
         # 1) costruzione/aggiornamento del grafo per Dijkstra
         self.build_graph_for_dijkstra(
@@ -858,7 +831,145 @@ class Model:
             rho_pair_max=rho_pair_max,
         )
 
+        # salva ultimo portafoglio Dijkstra (per Monte Carlo)
+        self.last_dij_tickers = list(portfolio)
+        self.last_dij_weights = dict(weights)
+
         return portfolio, weights
+
+    # SIMULAZIONI MONTE CARLO
+
+    def simulate_portfolio_paths(
+        self,
+        tickers: list[str],
+        weights: dict[str, float],
+        n_paths: int = 100,
+        n_days: int = 252,
+        seed: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Simula traiettorie di valore di portafoglio in un modello gaussiano
+        multivariato, usando mu e Sigma_sh stimati sull'intera storia.
+
+        Restituisce:
+        - paths: array shape (n_paths, n_days+1) con i valori simulati
+                 (partenza 1.0 al tempo 0).
+        - mean_path: array shape (n_days+1,) con la traiettoria media.
+        """
+        if self.current_mu is None or self.current_Sigma_sh is None:
+            raise RuntimeError(
+                "mu / Sigma_sh non disponibili. "
+                "Assicurati di aver chiamato estimate_risk() prima delle simulazioni."
+            )
+
+        if not tickers or not weights:
+            raise ValueError("Portafoglio vuoto: impossibile simulare.")
+
+        # vettore pesi nell'ordine dei tickers
+        w_vec = np.array([weights.get(t, 0.0) for t in tickers], dtype=float)
+        if w_vec.sum() <= 0:
+            raise ValueError("Somma pesi nulla nel portafoglio da simulare.")
+        w_vec = w_vec / w_vec.sum()
+
+        # allineo mu e Sigma_sh all'universo dei tickers
+        missing_mu = [t for t in tickers if t not in self.current_mu.index]
+        missing_S = [
+            t for t in tickers
+            if t not in self.current_Sigma_sh.index
+            or t not in self.current_Sigma_sh.columns
+        ]
+        if missing_mu or missing_S:
+            raise ValueError(
+                f"Titoli mancanti in mu o Sigma_sh. "
+                f"missing_mu={missing_mu}, missing_S={missing_S}"
+            )
+
+        mu_vec = self.current_mu.loc[tickers].astype(float).values  # (K,)
+        Sigma_sub = self.current_Sigma_sh.loc[tickers, tickers].astype(float).values
+
+        # rendimento atteso e varianza del portafoglio
+        mu_p = float(w_vec @ mu_vec)
+        var_p = float(w_vec @ Sigma_sub @ w_vec)
+        sigma_p = np.sqrt(var_p) if var_p > 0 else 0.0
+
+        # processo lognormale su rendimenti log
+        if seed is not None:
+            rng = np.random.default_rng(seed)
+        else:
+            rng = np.random.default_rng()
+
+        # shape (n_paths, n_days)
+        shocks = rng.normal(loc=mu_p, scale=sigma_p, size=(n_paths, n_days))
+        # valori cumulati (partenza 0 in log → valore 1 in livello)
+        log_paths = np.concatenate(
+            [np.zeros((n_paths, 1)), np.cumsum(shocks, axis=1)],
+            axis=1,
+        )
+        paths = np.exp(log_paths)  # parte da 1.0
+
+        # traiettoria media
+        mean_path = paths.mean(axis=0)
+
+        return paths, mean_path
+
+    def simulate_mc_for_last_portfolios(
+        self,
+        n_paths: int = 100,
+        n_days: int = 252,
+        seed_bb: int = 42,
+        seed_dij: int = 99,
+    ) -> dict[str, dict[str, np.ndarray]]:
+        """
+        Esegue la simulazione Monte Carlo per:
+        - l'ultimo portafoglio ottimo (B&B) salvato in last_portfolio_tickers/weights,
+        - l'ultimo portafoglio Dijkstra (calcolato via build_dijkstra_portfolio).
+
+        Restituisce un dizionario:
+            {
+                "bb": {"paths": ..., "mean": ...},
+                "dij": {"paths": ..., "mean": ...}
+            }
+        """
+        # portafoglio B&B
+        if not self.last_portfolio_tickers or not self.last_portfolio_weights:
+            raise RuntimeError(
+                "Portafoglio B&B non disponibile. "
+                "Esegui prima optimize_portfolio dal Controller."
+            )
+
+        tickers_bb = list(self.last_portfolio_tickers)
+        weights_bb = dict(self.last_portfolio_weights)
+
+        paths_bb, mean_bb = self.simulate_portfolio_paths(
+            tickers=tickers_bb,
+            weights=weights_bb,
+            n_paths=n_paths,
+            n_days=n_days,
+            seed=seed_bb,
+        )
+
+        # portafoglio Dijkstra
+        if not self.last_dij_tickers or not self.last_dij_weights:
+            raise RuntimeError(
+                "Portafoglio Dijkstra non disponibile. "
+                "Esegui prima build_dijkstra_portfolio dal Controller."
+            )
+
+        tickers_dij = list(self.last_dij_tickers)
+        weights_dij = dict(self.last_dij_weights)
+
+        paths_dij, mean_dij = self.simulate_portfolio_paths(
+            tickers=tickers_dij,
+            weights=weights_dij,
+            n_paths=n_paths,
+            n_days=n_days,
+            seed=seed_dij,
+        )
+
+        return {
+            "bb": {"paths": paths_bb, "mean": mean_bb},
+            "dij": {"paths": paths_dij, "mean": mean_dij},
+        }
 
 
 if __name__ == "__main__":
@@ -1000,11 +1111,11 @@ if __name__ == "__main__":
                     )
                 except Exception:
                     t1_d = time.time()
-                    print(f"ERRORE durante build_portfolio_dijkstra dopo {t1_d - t0_d:.2f} secondi:")
+                    print(f"ERRORE durante build_dijkstra_portfolio dopo {t1_d - t0_d:.2f} secondi:")
                     traceback.print_exc()
                 else:
                     t1_d = time.time()
-                    print(f"build_portfolio_dijkstra terminato in {t1_d - t0_d:.2f} secondi.\n")
+                    print(f"build_dijkstra_portfolio terminato in {t1_d - t0_d:.2f} secondi.\n")
                     print("Portafoglio Dijkstra:", port_dij)
                     print("Pesi Dijkstra:", w_dij)
                     print("Somma pesi:", sum(w_dij.values()))

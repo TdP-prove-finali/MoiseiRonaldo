@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple
 
 import flet as ft
+import numpy as np
 
 from model.selector import PortfolioSelector
 
@@ -476,6 +477,9 @@ class Controller:
                 lv=lv,
             )
 
+            # abilita Monte Carlo dopo un portafoglio Dijkstra valido
+            self._view.enable_montecarlo(True)
+
             self._view.update_page()
 
         except Exception as ex:
@@ -529,12 +533,85 @@ class Controller:
     # HANDLER: MONTECARLO
 
     def handle_montecarlo(self, e: ft.ControlEvent) -> None:
-        lv = self._view.txt_result_mc
-        if lv is None:
-            return
-        lv.controls.clear()
-        lv.controls.append(ft.Text("Simulazione Monte Carlo in corso..."))
-        self._view.update_page()
+        try:
+            lv = self._view.txt_result_mc
+            if lv is None:
+                return
+
+            lv.controls.clear()
+
+            # orizzonte: uso gli stessi controlli di rischio (slider anni)
+            years, risk_level, max_unrated_share = self._read_risk_controls()
+            n_days = years * 252  # approssimazione giorni di borsa
+
+            # numero di traiettorie: default 100, overridabile da campo view
+            n_paths_default = 100
+            txt_n_paths = getattr(self._view, "txt_mc_n_paths", None)
+            n_paths = self._parse_optional_int(
+                txt_n_paths,
+                n_paths_default,
+                "numero traiettorie Monte Carlo",
+            )
+
+            # log iniziale
+            lv.controls.append(
+                ft.Text(
+                    f"Simulazione Monte Carlo con {n_paths} traiettorie, "
+                    f"orizzonte {years} anni (~{n_days} giorni di borsa)."
+                )
+            )
+
+            # chiamata al Model: usa gli ultimi portafogli B&B e Dijkstra
+            results = self._model.simulate_mc_for_last_portfolios(
+                n_paths=n_paths,
+                n_days=n_days,
+            )
+
+            # per ogni portafoglio (B&B e Dijkstra) calcolo statistiche sui valori finali
+            for key, label in [("bb", "B&B"), ("dij", "Dijkstra")]:
+                data = results.get(key)
+                if not data:
+                    continue
+
+                paths = data["paths"]      # shape (n_paths, n_days+1)
+                mean_path = data["mean"]   # shape (n_days+1,)
+
+                if paths is None or paths.size == 0:
+                    lv.controls.append(
+                        ft.Text(f"Portafoglio {label}: nessun percorso simulato.")
+                    )
+                    continue
+
+                final_vals = paths[:, -1]  # valore a fine orizzonte (partenza 1.0)
+                mean_final = float(final_vals.mean())
+                std_final = float(final_vals.std(ddof=0))
+                p5, p50, p95 = np.percentile(final_vals, [5, 50, 95])
+                prob_loss = float((final_vals < 1.0).mean())
+
+                lv.controls.append(ft.Text(f"--- Portafoglio {label} ---"))
+                lv.controls.append(
+                    ft.Text(
+                        f"Valore atteso finale: {mean_final:.3f} (partenza 1.000); "
+                        f"deviazione std: {std_final:.3f}"
+                    )
+                )
+                lv.controls.append(
+                    ft.Text(
+                        f"Quantili finali (valore portafoglio): "
+                        f"5%={p5:.3f}, mediana={p50:.3f}, 95%={p95:.3f}"
+                    )
+                )
+                lv.controls.append(
+                    ft.Text(
+                        f"Probabilità di perdita (valore finale < 1.0): "
+                        f"{prob_loss:.1%}"
+                    )
+                )
+
+            self._view.update_page()
+
+        except Exception as ex:
+            self._show_error(f"Errore simulazione Monte Carlo: {ex}", target="mc")
 
     # HELPER LETTURA INPUT
 
